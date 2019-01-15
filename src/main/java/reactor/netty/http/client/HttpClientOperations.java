@@ -796,16 +796,28 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 
 		@Override
 		public Mono<Void> then() {
-			ByteBufAllocator alloc = parent.channel().alloc();
+			ByteBufAllocator alloc = parent.channel()
+			                               .alloc();
 			return Flux.from(source)
-			           .collect(alloc::heapBuffer, ByteBuf::writeBytes)
-			           .flatMap(agg -> {
-				           if (!HttpUtil.isTransferEncodingChunked(request) && !HttpUtil.isContentLengthSet(request)) {
-					           request.headers()
-					                  .setInt(HttpHeaderNames.CONTENT_LENGTH, agg.readableBytes());
-				           }
-				           return parent.then().thenEmpty(FutureMono.disposableWriteAndFlush(parent.channel(), Mono.just(agg)));
-			           });
+			           .switchOnFirst((signal, flux) -> {
+			               if (signal.hasValue()) {
+			                   ByteBuf buf = signal.get();
+			                   if (buf != null && buf.readableBytes() > 0) {
+			                       return flux.collect(alloc::heapBuffer, ByteBuf::writeBytes)
+			                                  .flatMap(agg -> {
+			                                      if (!HttpUtil.isTransferEncodingChunked(request) &&
+			                                              !HttpUtil.isContentLengthSet(request)) {
+			                                          request.headers()
+			                                                 .setInt(HttpHeaderNames.CONTENT_LENGTH, agg.readableBytes());
+			                                      }
+			                                      return parent.then()
+			                                                   .thenEmpty(FutureMono.disposableWriteAndFlush(parent.channel(), Mono.just(agg)));
+			                                  });
+			                   }
+			               }
+			               return parent.then();
+			           })
+			           .then();
 		}
 
 		@Override
