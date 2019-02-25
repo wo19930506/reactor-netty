@@ -29,9 +29,10 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.cert.CertificateException;
 import java.time.Duration;
-import java.util.Objects;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentSkipListSet;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -45,6 +46,8 @@ import javax.net.ssl.SSLException;
 
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
+import io.netty.channel.group.ChannelGroup;
+import io.netty.channel.group.DefaultChannelGroup;
 import io.netty.handler.codec.http.DefaultFullHttpResponse;
 import io.netty.handler.codec.http.HttpContentDecompressor;
 import io.netty.handler.codec.http.HttpHeaderNames;
@@ -57,6 +60,7 @@ import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.handler.ssl.util.SelfSignedCertificate;
 import io.netty.util.CharsetUtil;
+import io.netty.util.concurrent.DefaultEventExecutor;
 import org.junit.Assert;
 import org.junit.Ignore;
 import org.junit.Test;
@@ -65,14 +69,17 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.netty.ByteBufFlux;
 import reactor.netty.DisposableServer;
+import reactor.netty.FutureMono;
 import reactor.netty.NettyPipeline;
 import reactor.netty.SocketUtils;
 import reactor.netty.channel.AbortedException;
 import reactor.netty.http.server.HttpServer;
 import reactor.netty.resources.ConnectionProvider;
+import reactor.netty.resources.LoopResources;
 import reactor.netty.tcp.SslProvider;
 import reactor.netty.tcp.TcpServer;
 import reactor.test.StepVerifier;
+import reactor.util.concurrent.Queues;
 import reactor.util.context.Context;
 import reactor.util.function.Tuple2;
 import reactor.util.function.Tuples;
@@ -313,21 +320,22 @@ public class HttpClientTest {
 
 	@Test
 	@Ignore
-	public void postUpload() {
-		InputStream f = getClass().getResourceAsStream("/public/index.html");
+	public void postUpload() throws IOException {
 		HttpClient client =
 				HttpClient.create()
 				          .tcpConfiguration(tcpClient -> tcpClient.host("google.com"))
 				          .wiretap(true);
 
-		client.put()
-		      .uri("/post")
-		      .sendForm((req, form) -> form.multipart(true)
-		                                   .file("test", f)
-		                                   .attr("att1", "attr2")
-		                                   .file("test2", f))
-		      .responseSingle((r, buf) -> Mono.just(r.status().code()))
-		      .block(Duration.ofSeconds(30));
+		try (InputStream f = getClass().getResourceAsStream("/public/index.html")) {
+			client.put()
+			      .uri("/post")
+			      .sendForm((req, form) -> form.multipart(true)
+			                                   .file("test", f)
+			                                   .attr("att1", "attr2")
+			                                   .file("test2", f))
+			      .responseSingle((r, buf) -> Mono.just(r.status().code()))
+			      .block(Duration.ofSeconds(30));
+		}
 
 		Integer res = client.followRedirect(true)
 		                    .get()
@@ -979,15 +987,18 @@ public class HttpClientTest {
 		                          .responseContent()
 		                          .asString();
 
+		List<String> expected =
+				Flux.range(1, 20)
+				    .map(v -> "test")
+				    .collectList()
+				    .block();
+		Assert.assertNotNull(expected);
+
 		StepVerifier.create(
 				Flux.range(1, 10)
 				    .concatMap(i -> ws.take(2)
 				                      .log()))
-				    .expectNextSequence(
-				            Objects.requireNonNull(Flux.range(1, 20)
-				                                       .map(v -> "test")
-				                                       .collectList()
-				                                       .block()))
+				    .expectNextSequence(expected)
 				    .expectComplete()
 				    .verify();
 
@@ -1256,7 +1267,7 @@ public class HttpClientTest {
 				        .asString();
 
 		StepVerifier.create(content)
-		            .verifyError(HttpClientOperations.PrematureCloseException.class);
+		            .verifyError(PrematureCloseException.class);
 
 		assertThat(requestError.getAndSet(0)).isEqualTo(1);
 		assertThat(responseError.getAndSet(0)).isEqualTo(0);
@@ -1275,7 +1286,7 @@ public class HttpClientTest {
 				        .asString();
 
 		StepVerifier.create(content)
-		            .verifyError(HttpClientOperations.PrematureCloseException.class);
+		            .verifyError(PrematureCloseException.class);
 
 		assertThat(requestError.getAndSet(0)).isEqualTo(0);
 		assertThat(responseError.getAndSet(0)).isEqualTo(1);
@@ -1381,6 +1392,31 @@ public class HttpClientTest {
 	}
 
 	@Test
+	public void testExplicitSendMonoErrorOnGet() {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .handle((req, res) -> res.send(req.receive().retain()))
+				          .bindNow();
+
+		ConnectionProvider pool = ConnectionProvider.fixed("test", 1);
+
+		StepVerifier.create(
+				Flux.range(0, 1000)
+				    .flatMapDelayError(i ->
+				        createHttpClientForContextWithAddress(server, pool)
+				                .request(HttpMethod.GET)
+				                .uri("/")
+				                .send((req, out) -> out.send(Mono.error(new Exception("test"))))
+				                .responseContent(), Queues.SMALL_BUFFER_SIZE, Queues.XS_BUFFER_SIZE))
+				    .expectError()
+				    .verify(Duration.ofSeconds(30));
+
+		pool.dispose();
+		server.disposeNow();
+	}
+
+	@Test
 	public void testRetryNotEndlessIssue587() throws Exception {
 		ExecutorService threadPool = Executors.newCachedThreadPool();
 		int serverPort = SocketUtils.findAvailableTcpPort();
@@ -1461,5 +1497,135 @@ public class HttpClientTest {
 				server.close();
 			}
 		}
+	}
+
+	@Test
+	public void testIssue600_1() {
+		doTestIssue600(true);
+	}
+
+	@Test
+	public void testIssue600_2() {
+		doTestIssue600(false);
+	}
+
+	private void doTestIssue600(boolean withLoop) {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .handle((req, res) -> res.send(req.receive()
+				                                            .retain()
+				                                            .delaySubscription(Duration.ofSeconds(1))))
+				          .wiretap(true)
+				          .bindNow();
+
+		ConnectionProvider pool = ConnectionProvider.fixed("test", 10);
+		LoopResources loop = LoopResources.create("test", 4, true);
+		HttpClient client;
+		if (withLoop) {
+			client = createHttpClientForContextWithAddress(server, pool)
+			            .tcpConfiguration(tcpClient -> tcpClient.runOn(loop));
+		}
+		else {
+			client = createHttpClientForContextWithAddress(server, pool);
+		}
+
+		Set<String> threadNames = new ConcurrentSkipListSet<>();
+		StepVerifier.create(
+				Flux.range(1,4)
+				    .flatMap(i -> client.request(HttpMethod.GET)
+				                        .uri("/")
+				                        .send((req, out) -> out.send(Flux.empty()))
+				                        .responseContent()
+				                        .doFinally(s -> threadNames.add(Thread.currentThread().getName()))))
+ 		            .expectComplete()
+		            .verify(Duration.ofSeconds(30));
+
+		pool.dispose();
+		loop.dispose();
+		server.disposeNow();
+
+		assertThat(threadNames.size()).isGreaterThan(1);
+	}
+
+	@Test
+	public void testChannelGroupClosesAllConnections() throws Exception {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .route(r -> r.get("/never",
+				                  (req, res) -> res.sendString(Mono.never()))
+				              .get("/delay10",
+				                  (req, res) -> res.sendString(Mono.just("test")
+				                                                   .delayElement(Duration.ofSeconds(10))))
+				              .get("/delay1",
+				                  (req, res) -> res.sendString(Mono.just("test")
+				                                                   .delayElement(Duration.ofSeconds(1)))))
+				          .wiretap(true)
+				          .bindNow(Duration.ofSeconds(30));
+
+		ConnectionProvider connectionProvider = ConnectionProvider.elastic("disposeLater");
+
+		ChannelGroup group = new DefaultChannelGroup(new DefaultEventExecutor());
+
+		CountDownLatch latch1 = new CountDownLatch(3);
+		CountDownLatch latch2 = new CountDownLatch(3);
+
+		HttpClient client = createHttpClientForContextWithAddress(server, connectionProvider);
+
+		Flux.just("/never", "/delay10", "/delay1")
+		    .flatMap(s ->
+		            client.tcpConfiguration(
+		                      tcpClient -> tcpClient.doOnConnected(c -> {
+		                          c.onDispose()
+		                           .subscribe(null, null, latch2::countDown);
+		                          group.add(c.channel());
+		                          latch1.countDown();
+		                      }))
+		                  .get()
+		                  .uri(s)
+		                  .responseContent()
+		                  .aggregate()
+		                  .asString())
+		    .subscribe();
+
+		assertThat(latch1.await(30, TimeUnit.SECONDS)).isTrue();
+
+		Mono.whenDelayError(FutureMono.from(group.close()), connectionProvider.disposeLater())
+		    .block(Duration.ofSeconds(30));
+
+		assertThat(latch2.await(30, TimeUnit.SECONDS)).isTrue();
+
+		server.disposeNow();
+	}
+
+	@Test
+	public void testIssue614() {
+		DisposableServer server =
+				HttpServer.create()
+				          .port(0)
+				          .route(routes ->
+				              routes.post("/dump", (req, res) -> {
+				                  if (req.requestHeaders().contains("Transfer-Encoding")) {
+				                      return Mono.error(new Exception("Transfer-Encoding is not expected"));
+				                  }
+				                  return res.sendString(Mono.just("OK"));
+				              }))
+				          .wiretap(true)
+				          .bindNow();
+
+		StepVerifier.create(
+				createHttpClientForContextWithAddress(server)
+				        .post()
+				        .uri("/dump")
+				        .sendForm((req, form) -> form.attr("attribute", "value"))
+				        .responseContent()
+				        .aggregate()
+				        .asString())
+				    .expectNext("OK")
+				    .expectComplete()
+				    .verify(Duration.ofSeconds(30));
+
+		server.disposeNow();
 	}
 }

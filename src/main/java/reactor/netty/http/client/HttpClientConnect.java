@@ -65,6 +65,7 @@ import io.netty.handler.ssl.ApplicationProtocolNegotiationHandler;
 import io.netty.handler.ssl.JdkSslContext;
 import io.netty.handler.ssl.SslContext;
 import io.netty.util.AsciiString;
+import io.netty.util.AttributeKey;
 import io.netty.util.concurrent.Future;
 import io.netty.util.concurrent.GenericFutureListener;
 import org.reactivestreams.Publisher;
@@ -141,8 +142,17 @@ final class HttpClientConnect extends HttpClient {
 
 				EventLoopGroup elg = loops.onClient(useNative);
 
-				b.group(elg)
-				 .channel(loops.onChannel(elg));
+				Integer maxConnections = (Integer) b.config().attrs().get(AttributeKey.valueOf("maxConnections"));
+
+				if (maxConnections != null && maxConnections != -1 && elg instanceof Supplier) {
+					EventLoopGroup delegate = (EventLoopGroup) ((Supplier) elg).get();
+					b.group(delegate)
+					 .channel(loops.onChannel(delegate));
+				}
+				else {
+					b.group(elg)
+					 .channel(loops.onChannel(elg));
+				}
 			}
 
 			HttpClientConfiguration conf = HttpClientConfiguration.getAndClean(b);
@@ -384,7 +394,7 @@ final class HttpClientConnect extends HttpClient {
 				log.debug(format(connection.channel(), "The connection observed an error, " +
 						"the request will be retried"), error);
 			}
-			else {
+			else if (log.isWarnEnabled()) {
 				log.warn(format(connection.channel(), "The connection observed an error"), error);
 			}
 			sink.error(error);
@@ -619,8 +629,10 @@ final class HttpClientConnect extends HttpClient {
 		void channel(Channel channel) {
 			Supplier<String>[] redirectedFrom = this.redirectedFrom;
 			if (redirectedFrom != null) {
-				channel.attr(HttpClientOperations.REDIRECT_ATTR_KEY)
-				       .set(redirectedFrom);
+				ChannelOperations<?, ?> ops = ChannelOperations.get(channel);
+				if (ops instanceof HttpClientOperations) {
+					((HttpClientOperations) ops).redirectedFrom = redirectedFrom;
+				}
 			}
 		}
 

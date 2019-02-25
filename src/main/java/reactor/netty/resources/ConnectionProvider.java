@@ -78,7 +78,12 @@ public interface ConnectionProvider extends Disposable {
 	 * {@link Connection}
 	 */
 	static ConnectionProvider elastic(String name) {
-		return new PooledConnectionProvider(name, SimpleChannelPool::new);
+		return new PooledConnectionProvider(name,
+				(bootstrap, handler, checker) -> new SimpleChannelPool(bootstrap,
+						handler,
+						checker,
+						true,
+						false));
 	}
 
 	/**
@@ -144,8 +149,10 @@ public interface ConnectionProvider extends Disposable {
 						FixedChannelPool.AcquireTimeoutAction.FAIL,
 						acquireTimeout,
 						maxConnections,
-						Integer.MAX_VALUE
-						));
+						Integer.MAX_VALUE,
+						true,
+						false),
+				maxConnections);
 	}
 
 	/**
@@ -174,5 +181,14 @@ public interface ConnectionProvider extends Disposable {
 	 **/
 	default Mono<Void> disposeLater() {
 		return Mono.empty(); //noop default
+	}
+
+	/**
+	 * Returns the maximum number of connections before starting pending
+	 *
+	 * @return the maximum number of connections before starting pending
+	 */
+	default int maxConnections() {
+		return -1;
 	}
 }

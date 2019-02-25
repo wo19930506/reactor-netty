@@ -16,7 +16,6 @@
 
 package reactor.netty.http.client;
 
-import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URISyntaxException;
@@ -61,7 +60,6 @@ import io.netty.handler.codec.http.multipart.HttpDataFactory;
 import io.netty.handler.codec.http.multipart.HttpPostRequestEncoder;
 import io.netty.handler.codec.http.websocketx.extensions.compression.WebSocketClientCompressionHandler;
 import io.netty.handler.stream.ChunkedWriteHandler;
-import io.netty.util.AttributeKey;
 import io.netty.util.ReferenceCountUtil;
 import org.reactivestreams.Publisher;
 import reactor.core.CoreSubscriber;
@@ -91,12 +89,13 @@ import static reactor.netty.ReactorNetty.format;
 class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 		implements HttpClientResponse, HttpClientRequest {
 
-	final Supplier<String>[]    redirectedFrom;
 	final boolean               isSecure;
 	final HttpRequest           nettyRequest;
 	final HttpHeaders           requestHeaders;
 	final ClientCookieEncoder   cookieEncoder;
 	final ClientCookieDecoder   cookieDecoder;
+
+	Supplier<String>[]    redirectedFrom = EMPTY_REDIRECTIONS;
 
 	volatile ResponseState responseState;
 
@@ -122,10 +121,6 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 		this.isSecure = c.channel()
 		                 .pipeline()
 		                 .get(NettyPipeline.SslHandler) != null;
-		Supplier<String>[] redirects = c.channel()
-		                                .attr(REDIRECT_ATTR_KEY)
-		                                .get();
-		this.redirectedFrom = redirects == null ? EMPTY_REDIRECTIONS : redirects;
 		this.nettyRequest = new DefaultHttpRequest(HttpVersion.HTTP_1_1, HttpMethod.GET, "/");
 		this.requestHeaders = nettyRequest.headers();
 		this.cookieDecoder = decoder;
@@ -489,7 +484,14 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 			}
 
 			if (notRedirected(response)) {
-				listener().onStateChange(this, HttpClientState.RESPONSE_RECEIVED);
+				try {
+					listener().onStateChange(this, HttpClientState.RESPONSE_RECEIVED);
+				}
+				catch (Exception e) {
+					onInboundError(e);
+					ReferenceCountUtil.release(msg);
+					return;
+				}
 			}
 			if (msg instanceof FullHttpResponse) {
 				super.onInboundNext(ctx, msg);
@@ -678,7 +680,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 				df = encoder.newFactory;
 
 				if (!encoder.isMultipart()) {
-					parent.chunkedTransfer(false);
+					parent.requestHeaders.remove(HttpHeaderNames.TRANSFER_ENCODING);
 				}
 
 				// Returned value is deliberately ignored
@@ -723,7 +725,7 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 
 			}
 			catch (Throwable e) {
-				Exceptions.throwIfFatal(e);
+				Exceptions.throwIfJvmFatal(e);
 				df.cleanRequestHttpData(parent.nettyRequest);
 				Operators.error(s, Exceptions.unwrap(e));
 			}
@@ -735,29 +737,6 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 	static final Supplier<String>[]     EMPTY_REDIRECTIONS = (Supplier<String>[])new Supplier[0];
 	static final Logger                 log                =
 			Loggers.getLogger(HttpClientOperations.class);
-	static final AttributeKey<Supplier<String>[]> REDIRECT_ATTR_KEY  =
-			AttributeKey.newInstance("httpRedirects");
-
-	static final class PrematureCloseException extends IOException {
-
-		static final PrematureCloseException BEFORE_RESPONSE_SENDING_REQUEST =
-				new PrematureCloseException("Connection has been closed BEFORE response, while sending request body");
-
-		static final PrematureCloseException BEFORE_RESPONSE =
-				new PrematureCloseException("Connection prematurely closed BEFORE response");
-
-		static final PrematureCloseException DURING_RESPONSE =
-				new PrematureCloseException("Connection prematurely closed DURING response");
-
-		PrematureCloseException(String message) {
-			super(message);
-		}
-
-		@Override
-		public synchronized Throwable fillInStackTrace() {
-			return this;
-		}
-	}
 
 	static final class GetOrHeadAggregateOutbound implements NettyOutbound {
 
@@ -809,7 +788,8 @@ class HttpClientOperations extends HttpOperations<NettyInbound, NettyOutbound>
 				           }
 				           agg.release();
 				           return parent.then();
-			           });
+			           })
+			           .doOnDiscard(ByteBuf.class, ByteBuf::release);
 		}
 
 		@Override

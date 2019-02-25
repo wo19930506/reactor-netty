@@ -16,6 +16,7 @@
 
 package reactor.netty.tcp;
 
+import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.net.SocketAddress;
 import java.util.Objects;
@@ -133,9 +134,7 @@ final class TcpServerBind extends TcpServer {
 				.childOption(ChannelOption.SO_KEEPALIVE, true)
 				.childOption(ChannelOption.TCP_NODELAY, true)
 				.childOption(ChannelOption.CONNECT_TIMEOUT_MILLIS, 30000)
-				.localAddress(
-						InetSocketAddressUtil.createUnresolved(NetUtil.LOCALHOST.getHostAddress(),
-								DEFAULT_PORT));
+				.localAddress(new InetSocketAddress(DEFAULT_PORT));
 	}
 
 	static final class DisposableBind
@@ -212,7 +211,7 @@ final class TcpServerBind extends TcpServer {
 		@Override
 		public void onUncaughtException(Connection connection, Throwable error) {
 			ChannelOperations ops = ChannelOperations.get(connection.channel());
-			if (ops == null && AbortedException.isConnectionReset(error)) {
+			if (ops == null && (error instanceof IOException || AbortedException.isConnectionReset(error))) {
 				if (log.isDebugEnabled()) {
 					log.debug(format(connection.channel(), "onUncaughtException(" + connection + ")"), error);
 				}

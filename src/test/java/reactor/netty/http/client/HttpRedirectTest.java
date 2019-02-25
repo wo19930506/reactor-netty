@@ -34,8 +34,6 @@ import reactor.test.StepVerifier;
 
 public class HttpRedirectTest {
 
-	private final int numberOfTests = 1000;
-
 	@Test
 	@Ignore
 	public void deadlockWhenRedirectsToSameUrl(){
@@ -74,7 +72,7 @@ public class HttpRedirectTest {
 				          .addressSupplier(server::address);
 
 		try {
-			Flux.range(0, this.numberOfTests)
+			Flux.range(0, 1000)
 			    .concatMap(i -> client.followRedirect(true)
 			                          .post()
 			                          .uri("/login")
@@ -315,5 +313,38 @@ public class HttpRedirectTest {
 		            .verify(Duration.ofSeconds(30));
 
 		server.disposeNow();
+	}
+
+	@Test
+	public void testIssue606() {
+		final int serverPort = SocketUtils.findAvailableTcpPort();
+
+		DisposableServer server =
+				HttpServer.create()
+				          .port(serverPort)
+				          .host("localhost")
+				          .handle((req, res) -> res.sendRedirect("http://localhost:" + serverPort))
+				          .wiretap(true)
+				          .bindNow();
+
+		AtomicInteger followRedirects = new AtomicInteger(0);
+		HttpClient.create()
+		          .addressSupplier(server::address)
+		          .wiretap(true)
+		          .followRedirect((req, res) -> {
+		              boolean result = req.redirectedFrom().length < 4;
+		              if (result) {
+		                  followRedirects.getAndIncrement();
+		              }
+		              return result;
+		          })
+		          .get()
+		          .uri("/")
+		          .responseContent()
+		          .blockLast();
+
+		server.disposeNow();
+
+		Assertions.assertThat(followRedirects.get()).isEqualTo(4);
 	}
 }
